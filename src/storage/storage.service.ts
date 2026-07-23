@@ -1,6 +1,15 @@
 import { Injectable, InternalServerErrorException, NotFoundException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { S3Client, PutObjectCommand, DeleteObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
+import { 
+  S3Client, 
+  PutObjectCommand, 
+  DeleteObjectCommand, 
+  GetObjectCommand,
+  CreateMultipartUploadCommand,
+  UploadPartCommand,
+  CompleteMultipartUploadCommand,
+  CompletedPart
+} from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { randomUUID } from 'crypto';
 import * as path from 'path';
@@ -90,6 +99,64 @@ export class StorageService {
       await this.s3Client.send(command);
     } catch (error) {
       throw new InternalServerErrorException(`Failed to delete file: ${error.message}`);
+    }
+  }
+
+  async startMultipartUpload(fileName: string, contentType: string): Promise<{ uploadId: string; key: string }> {
+    try {
+      const ext = path.extname(fileName);
+      const key = `${randomUUID()}${ext}`;
+
+      const command = new CreateMultipartUploadCommand({
+        Bucket: this.bucketName,
+        Key: key,
+        ContentType: contentType,
+      });
+
+      const response = await this.s3Client.send(command);
+      if (!response.UploadId) {
+        throw new Error('UploadId is missing from AWS response');
+      }
+
+      return { uploadId: response.UploadId, key };
+    } catch (error) {
+      throw new InternalServerErrorException(`Failed to start multipart upload: ${error.message}`);
+    }
+  }
+
+  async getMultipartPreSignedUrl(key: string, uploadId: string, partNumber: number): Promise<string> {
+    try {
+      const command = new UploadPartCommand({
+        Bucket: this.bucketName,
+        Key: key,
+        UploadId: uploadId,
+        PartNumber: partNumber,
+      });
+
+      // URL expires in 15 minutes for each part
+      return await getSignedUrl(this.s3Client, command, { expiresIn: 900 });
+    } catch (error) {
+      throw new InternalServerErrorException(`Failed to generate presigned URL for part: ${error.message}`);
+    }
+  }
+
+  async completeMultipartUpload(key: string, uploadId: string, parts: CompletedPart[]): Promise<void> {
+    try {
+      // S3 expects parts to be sorted by PartNumber
+      const sortedParts = parts.sort((a, b) => (a.PartNumber ?? 0) - (b.PartNumber ?? 0));
+
+      const command = new CompleteMultipartUploadCommand({
+        Bucket: this.bucketName,
+        Key: key,
+        UploadId: uploadId,
+        MultipartUpload: {
+          Parts: sortedParts,
+        },
+      });
+
+      await this.s3Client.send(command);
+    } catch (error) {
+      throw new InternalServerErrorException(`Failed to complete multipart upload: ${error.message}`);
     }
   }
 }
