@@ -49,6 +49,25 @@ export class StorageService {
     }
   }
 
+  async getPresignedPutUrl(fileName: string, contentType: string): Promise<{ url: string; key: string }> {
+    try {
+      const ext = path.extname(fileName);
+      const key = `${randomUUID()}${ext}`;
+
+      const command = new PutObjectCommand({
+        Bucket: this.bucketName,
+        Key: key,
+        ContentType: contentType,
+      });
+
+      // URL expires in 15 minutes for uploads
+      const url = await getSignedUrl(this.s3Client, command, { expiresIn: 900 });
+      return { url, key };
+    } catch (error) {
+      throw new InternalServerErrorException(`Failed to generate presigned PUT URL: ${error.message}`);
+    }
+  }
+
   async getPresignedUrl(key: string): Promise<string> {
     try {
       const command = new GetObjectCommand({

@@ -4,10 +4,12 @@ import {
   Get, 
   Delete, 
   Param, 
+  Body,
   UseInterceptors, 
   UploadedFile,
   ParseFilePipe,
-  MaxFileSizeValidator
+  MaxFileSizeValidator,
+  BadRequestException
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { ApiTags, ApiOperation, ApiConsumes, ApiBody, ApiParam, ApiResponse } from '@nestjs/swagger';
@@ -47,6 +49,26 @@ export class StorageController {
   ) {
     const key = await this.storageService.uploadFile(file);
     return { key };
+  }
+
+  @Post('presign-upload')
+  @ApiOperation({ summary: 'Get a presigned URL to upload a file directly from client' })
+  @ApiBody({
+    schema: {
+      type: 'object',
+      properties: {
+        fileName: { type: 'string', example: 'image.jpg' },
+        contentType: { type: 'string', example: 'image/jpeg' },
+      },
+      required: ['fileName', 'contentType'],
+    },
+  })
+  @ApiResponse({ status: 201, description: 'Returns the presigned URL and file key' })
+  async getPresignedPutUrl(@Body() body: { fileName: string; contentType: string }) {
+    if (!body.fileName || !body.contentType) {
+      throw new BadRequestException('fileName and contentType are required');
+    }
+    return await this.storageService.getPresignedPutUrl(body.fileName, body.contentType);
   }
 
   @Get('files/:key')
