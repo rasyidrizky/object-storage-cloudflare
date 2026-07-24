@@ -32,6 +32,13 @@
       console.log(msg);
     }
 
+    async function calculateHash(file) {
+      const buffer = await file.arrayBuffer();
+      const hashBuffer = await crypto.subtle.digest('SHA-256', buffer);
+      const hashArray = Array.from(new Uint8Array(hashBuffer));
+      return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+
     // 1. SIMPLE PRESIGNED UPLOAD
     async function simplePresignedUpload() {
       const file = fileInput.files[0];
@@ -40,10 +47,11 @@
       try {
         log('\n--- STARTING SIMPLE UPLOAD ---');
         log(`1. Requesting URL for ${file.name} from NestJS...`);
+        const hash = await calculateHash(file);
         const res = await fetch('http://localhost:3000/presign-upload', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ fileName: file.name, contentType: file.type })
+          body: JSON.stringify({ fileName: file.name, contentType: file.type, size: file.size, hash })
         });
         const { url, key } = await res.json();
         
@@ -54,8 +62,19 @@
           body: file
         });
         
-        if (uploadRes.ok) log('✅ Simple Upload Success! Key: ' + key);
-        else log('❌ Upload failed: ' + uploadRes.statusText);
+        if (uploadRes.ok) {
+          log('✅ Simple Upload to R2 Success! Key: ' + key);
+          log('3. Completing upload on NestJS...');
+          const completeRes = await fetch('http://localhost:3000/presign/complete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ key, size: file.size, hash })
+          });
+          if (completeRes.ok) log('✅ Upload completely recorded!');
+          else log('❌ Failed to record upload.');
+        } else {
+          log('❌ Upload failed: ' + uploadRes.statusText);
+        }
       } catch (err) {
         log('❌ Error: ' + err.message);
       }
@@ -69,10 +88,11 @@
       try {
         log('\n--- STARTING MULTIPART UPLOAD ---');
         log('1. Starting multipart upload via NestJS...');
+        const hash = await calculateHash(file);
         const startRes = await fetch('http://localhost:3000/multipart/start', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ fileName: file.name, contentType: file.type })
+          body: JSON.stringify({ fileName: file.name, contentType: file.type, size: file.size, hash })
         });
         const { uploadId, key } = await startRes.json();
         
@@ -112,7 +132,7 @@
         const completeRes = await fetch('http://localhost:3000/multipart/complete', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ key, uploadId, parts })
+          body: JSON.stringify({ key, uploadId, parts, size: file.size, hash })
         });
         
         if (completeRes.ok) log('✅ Multipart Upload Success! Key: ' + key);

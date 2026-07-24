@@ -1,5 +1,7 @@
-import { Injectable, InternalServerErrorException, NotFoundException } from '@nestjs/common';
+import { Injectable, InternalServerErrorException, NotFoundException, BadRequestException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { PrismaService } from '../prisma/prisma.service';
+import { createHash } from 'crypto';
 import { 
   S3Client, 
   PutObjectCommand, 
@@ -19,7 +21,10 @@ export class StorageService {
   private readonly s3Client: S3Client;
   private readonly bucketName: string;
 
-  constructor(private readonly configService: ConfigService) {
+  constructor(
+    private readonly configService: ConfigService,
+    private readonly prisma: PrismaService,
+  ) {
     const accountId = this.configService.get<string>('R2_ACCOUNT_ID');
     const accessKeyId = this.configService.get<string>('R2_ACCESS_KEY_ID');
     const secretAccessKey = this.configService.get<string>('R2_SECRET_ACCESS_KEY');
@@ -44,6 +49,9 @@ export class StorageService {
       const ext = path.extname(file.originalname);
       const key = `${randomUUID()}${ext}`;
 
+      // Calculate SHA-256 hash
+      const hash = createHash('sha256').update(file.buffer).digest('hex');
+
       const command = new PutObjectCommand({
         Bucket: this.bucketName,
         Key: key,
@@ -52,13 +60,25 @@ export class StorageService {
       });
 
       await this.s3Client.send(command);
+
+      // Save to database
+      await this.prisma.fileMetadata.create({
+        data: {
+          key,
+          size: file.size,
+          mimeType: file.mimetype,
+          hash,
+          status: 'UPLOADED',
+        },
+      });
+
       return key;
     } catch (error) {
       throw new InternalServerErrorException(`Failed to upload file: ${error.message}`);
     }
   }
 
-  async getPresignedPutUrl(fileName: string, contentType: string): Promise<{ url: string; key: string }> {
+  async getPresignedPutUrl(fileName: string, contentType: string, size?: number, hash?: string): Promise<{ url: string; key: string }> {
     try {
       const ext = path.extname(fileName);
       const key = `${randomUUID()}${ext}`;
@@ -71,6 +91,18 @@ export class StorageService {
 
       // URL expires in 15 minutes for uploads
       const url = await getSignedUrl(this.s3Client, command, { expiresIn: 900 });
+
+      // Save PENDING record
+      await this.prisma.fileMetadata.create({
+        data: {
+          key,
+          size,
+          mimeType: contentType,
+          hash,
+          status: 'PENDING',
+        },
+      });
+
       return { url, key };
     } catch (error) {
       throw new InternalServerErrorException(`Failed to generate presigned PUT URL: ${error.message}`);
@@ -97,12 +129,19 @@ export class StorageService {
         Key: key,
       });
       await this.s3Client.send(command);
+
+      // Also delete from database
+      await this.prisma.fileMetadata.delete({
+        where: { key },
+      }).catch(() => {
+        // Ignore if not found in db
+      });
     } catch (error) {
       throw new InternalServerErrorException(`Failed to delete file: ${error.message}`);
     }
   }
 
-  async startMultipartUpload(fileName: string, contentType: string): Promise<{ uploadId: string; key: string }> {
+  async startMultipartUpload(fileName: string, contentType: string, size?: number, hash?: string): Promise<{ uploadId: string; key: string }> {
     try {
       const ext = path.extname(fileName);
       const key = `${randomUUID()}${ext}`;
@@ -117,6 +156,16 @@ export class StorageService {
       if (!response.UploadId) {
         throw new Error('UploadId is missing from AWS response');
       }
+
+      await this.prisma.fileMetadata.create({
+        data: {
+          key,
+          size,
+          mimeType: contentType,
+          hash,
+          status: 'PENDING',
+        },
+      });
 
       return { uploadId: response.UploadId, key };
     } catch (error) {
@@ -140,7 +189,7 @@ export class StorageService {
     }
   }
 
-  async completeMultipartUpload(key: string, uploadId: string, parts: CompletedPart[]): Promise<void> {
+  async completeMultipartUpload(key: string, uploadId: string, parts: CompletedPart[], size?: number, hash?: string): Promise<void> {
     try {
       // S3 expects parts to be sorted by PartNumber
       const sortedParts = parts.sort((a, b) => (a.PartNumber ?? 0) - (b.PartNumber ?? 0));
@@ -155,8 +204,39 @@ export class StorageService {
       });
 
       await this.s3Client.send(command);
+
+      await this.prisma.fileMetadata.update({
+        where: { key },
+        data: {
+          status: 'UPLOADED',
+          ...(size && { size }),
+          ...(hash && { hash }),
+        },
+      });
     } catch (error) {
       throw new InternalServerErrorException(`Failed to complete multipart upload: ${error.message}`);
     }
+  }
+
+  async completePresignedUpload(key: string, size?: number, hash?: string): Promise<void> {
+    try {
+      await this.prisma.fileMetadata.update({
+        where: { key },
+        data: {
+          status: 'UPLOADED',
+          ...(size && { size }),
+          ...(hash && { hash }),
+        },
+      });
+    } catch (error) {
+      throw new InternalServerErrorException(`Failed to complete presigned upload: ${error.message}`);
+    }
+  }
+
+  async listFiles() {
+    return this.prisma.fileMetadata.findMany({
+      where: { status: 'UPLOADED' },
+      orderBy: { uploadedAt: 'desc' },
+    });
   }
 }

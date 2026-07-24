@@ -9,6 +9,7 @@ import {
   UploadedFile,
   ParseFilePipe,
   MaxFileSizeValidator,
+  FileTypeValidator,
   BadRequestException
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
@@ -41,6 +42,7 @@ export class StorageController {
       new ParseFilePipe({
         validators: [
           new MaxFileSizeValidator({ maxSize: 10 * 1024 * 1024 }), // 10MB limit
+          new FileTypeValidator({ fileType: '.(png|jpeg|jpg|pdf|mp4|webp)' }),
         ],
         fileIsRequired: true,
       }),
@@ -59,16 +61,18 @@ export class StorageController {
       properties: {
         fileName: { type: 'string', example: 'image.jpg' },
         contentType: { type: 'string', example: 'image/jpeg' },
+        size: { type: 'number' },
+        hash: { type: 'string' },
       },
       required: ['fileName', 'contentType'],
     },
   })
   @ApiResponse({ status: 201, description: 'Returns the presigned URL and file key' })
-  async getPresignedPutUrl(@Body() body: { fileName: string; contentType: string }) {
+  async getPresignedPutUrl(@Body() body: { fileName: string; contentType: string; size?: number; hash?: string }) {
     if (!body.fileName || !body.contentType) {
       throw new BadRequestException('fileName and contentType are required');
     }
-    return await this.storageService.getPresignedPutUrl(body.fileName, body.contentType);
+    return await this.storageService.getPresignedPutUrl(body.fileName, body.contentType, body.size, body.hash);
   }
 
   @Post('multipart/start')
@@ -79,16 +83,18 @@ export class StorageController {
       properties: {
         fileName: { type: 'string', example: 'large-video.mp4' },
         contentType: { type: 'string', example: 'video/mp4' },
+        size: { type: 'number' },
+        hash: { type: 'string' },
       },
       required: ['fileName', 'contentType'],
     },
   })
   @ApiResponse({ status: 201, description: 'Returns the uploadId and file key' })
-  async startMultipartUpload(@Body() body: { fileName: string; contentType: string }) {
+  async startMultipartUpload(@Body() body: { fileName: string; contentType: string; size?: number; hash?: string }) {
     if (!body.fileName || !body.contentType) {
       throw new BadRequestException('fileName and contentType are required');
     }
-    return await this.storageService.startMultipartUpload(body.fileName, body.contentType);
+    return await this.storageService.startMultipartUpload(body.fileName, body.contentType, body.size, body.hash);
   }
 
   @Post('multipart/presign-part')
@@ -131,17 +137,48 @@ export class StorageController {
             }
           } 
         },
+        size: { type: 'number' },
+        hash: { type: 'string' },
       },
       required: ['key', 'uploadId', 'parts'],
     },
   })
   @ApiResponse({ status: 201, description: 'Multipart upload completed successfully' })
-  async completeMultipartUpload(@Body() body: { key: string; uploadId: string; parts: { ETag: string; PartNumber: number }[] }) {
+  async completeMultipartUpload(@Body() body: { key: string; uploadId: string; parts: { ETag: string; PartNumber: number }[]; size?: number; hash?: string }) {
     if (!body.key || !body.uploadId || !body.parts || !Array.isArray(body.parts)) {
       throw new BadRequestException('key, uploadId, and parts array are required');
     }
-    await this.storageService.completeMultipartUpload(body.key, body.uploadId, body.parts);
+    await this.storageService.completeMultipartUpload(body.key, body.uploadId, body.parts, body.size, body.hash);
     return { message: 'Multipart upload completed successfully' };
+  }
+
+  @Post('presign/complete')
+  @ApiOperation({ summary: 'Complete a presigned upload' })
+  @ApiBody({
+    schema: {
+      type: 'object',
+      properties: {
+        key: { type: 'string' },
+        size: { type: 'number' },
+        hash: { type: 'string' },
+      },
+      required: ['key'],
+    },
+  })
+  @ApiResponse({ status: 201, description: 'Presigned upload completed successfully' })
+  async completePresignedUpload(@Body() body: { key: string; size?: number; hash?: string }) {
+    if (!body.key) {
+      throw new BadRequestException('key is required');
+    }
+    await this.storageService.completePresignedUpload(body.key, body.size, body.hash);
+    return { message: 'Presigned upload completed successfully' };
+  }
+
+  @Get('files')
+  @ApiOperation({ summary: 'List uploaded files' })
+  @ApiResponse({ status: 200, description: 'Returns a list of files' })
+  async listFiles() {
+    return this.storageService.listFiles();
   }
 
   @Get('files/:key')
