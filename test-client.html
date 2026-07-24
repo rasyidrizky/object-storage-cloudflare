@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Direct R2 Upload Tester</title>
+  <style>
+    body { font-family: sans-serif; padding: 2rem; max-width: 600px; margin: auto; }
+    button { padding: 10px 15px; margin-top: 10px; cursor: pointer; }
+    #logs { background: #f4f4f4; padding: 15px; margin-top: 20px; white-space: pre-wrap; font-family: monospace; border-radius: 5px; height: 300px; overflow-y: auto;}
+  </style>
+</head>
+<body>
+
+  <h2>Upload directly to Cloudflare R2</h2>
+  <p>Select a file to test the two different direct upload methods we built.</p>
+  
+  <input type="file" id="fileInput" />
+  
+  <br/>
+  <button onclick="simplePresignedUpload()">1. Simple Presigned Upload (Good for small files)</button>
+  <button onclick="multipartUpload()">2. Multipart Upload (Good for >50MB files)</button>
+
+  <div id="logs">Logs will appear here...</div>
+
+  <script>
+    const fileInput = document.getElementById('fileInput');
+    const logs = document.getElementById('logs');
+
+    function log(msg) {
+      logs.textContent += '\n' + msg;
+      logs.scrollTop = logs.scrollHeight;
+      console.log(msg);
+    }
+
+    // 1. SIMPLE PRESIGNED UPLOAD
+    async function simplePresignedUpload() {
+      const file = fileInput.files[0];
+      if (!file) return alert('Please select a file first.');
+      
+      try {
+        log('\n--- STARTING SIMPLE UPLOAD ---');
+        log(`1. Requesting URL for ${file.name} from NestJS...`);
+        const res = await fetch('http://localhost:3000/presign-upload', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ fileName: file.name, contentType: file.type })
+        });
+        const { url, key } = await res.json();
+        
+        log(`2. Uploading file directly to R2...`);
+        const uploadRes = await fetch(url, {
+          method: 'PUT',
+          headers: { 'Content-Type': file.type },
+          body: file
+        });
+        
+        if (uploadRes.ok) log('✅ Simple Upload Success! Key: ' + key);
+        else log('❌ Upload failed: ' + uploadRes.statusText);
+      } catch (err) {
+        log('❌ Error: ' + err.message);
+      }
+    }
+
+    // 2. MULTIPART UPLOAD
+    async function multipartUpload() {
+      const file = fileInput.files[0];
+      if (!file) return alert('Please select a file first.');
+      
+      try {
+        log('\n--- STARTING MULTIPART UPLOAD ---');
+        log('1. Starting multipart upload via NestJS...');
+        const startRes = await fetch('http://localhost:3000/multipart/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ fileName: file.name, contentType: file.type })
+        });
+        const { uploadId, key } = await startRes.json();
+        
+        // AWS S3 Minimum chunk size is 5MB
+        const CHUNK_SIZE = 5 * 1024 * 1024; 
+        const numChunks = Math.ceil(file.size / CHUNK_SIZE);
+        const parts = [];
+        
+        for (let i = 0; i < numChunks; i++) {
+          const partNumber = i + 1;
+          const start = i * CHUNK_SIZE;
+          const end = Math.min(start + CHUNK_SIZE, file.size);
+          const chunk = file.slice(start, end);
+          
+          log(`2. Requesting URL for chunk ${partNumber}/${numChunks}...`);
+          const partRes = await fetch('http://localhost:3000/multipart/presign-part', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ key, uploadId, partNumber })
+          });
+          const { url } = await partRes.json();
+          
+          log(`3. Uploading chunk ${partNumber}/${numChunks} to R2...`);
+          const uploadRes = await fetch(url, {
+            method: 'PUT',
+            body: chunk // Notice we do NOT set Content-Type for parts
+          });
+          
+          if (!uploadRes.ok) throw new Error('Failed to upload part ' + partNumber);
+          
+          // Capture ETag header returned by Cloudflare
+          const etag = uploadRes.headers.get('ETag');
+          parts.push({ PartNumber: partNumber, ETag: etag });
+        }
+        
+        log('4. Completing multipart upload via NestJS...');
+        const completeRes = await fetch('http://localhost:3000/multipart/complete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ key, uploadId, parts })
+        });
+        
+        if (completeRes.ok) log('✅ Multipart Upload Success! Key: ' + key);
+        else log('❌ Failed to complete upload.');
+      } catch (err) {
+        log('❌ Error: ' + err.message);
+      }
+    }
+  </script>
+</body>
+</html>
