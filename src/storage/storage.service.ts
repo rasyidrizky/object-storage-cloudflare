@@ -44,12 +44,35 @@ export class StorageService {
     });
   }
 
-  async uploadFile(file: Express.Multer.File, uploaderId?: number): Promise<string> {
-    try {
-      const ext = path.extname(file.originalname);
-      const key = `${randomUUID()}${ext}`;
+  private async getNextVersionInfo(fileName: string, existingLogicalKey?: string): Promise<{ logicalKey: string, version: number, key: string }> {
+    const ext = path.extname(fileName);
+    let logicalKey = existingLogicalKey || randomUUID();
+    let version = 1;
 
-      // Calculate SHA-256 hash
+    if (existingLogicalKey) {
+      const latest = await this.prisma.fileMetadata.findFirst({
+        where: { logicalKey: existingLogicalKey },
+        orderBy: { version: 'desc' },
+      });
+      if (latest) {
+        version = latest.version + 1;
+      }
+    }
+
+    const key = `${logicalKey}/v${version}${ext}`;
+    return { logicalKey, version, key };
+  }
+
+  private async updateCurrentVersionFlag(logicalKey: string) {
+    await this.prisma.fileMetadata.updateMany({
+      where: { logicalKey, isCurrent: true },
+      data: { isCurrent: false },
+    });
+  }
+
+  async uploadFile(file: Express.Multer.File, uploaderId?: number, existingLogicalKey?: string): Promise<{ logicalKey: string, version: number, key: string }> {
+    try {
+      const { logicalKey, version, key } = await this.getNextVersionInfo(file.originalname, existingLogicalKey);
       const hash = createHash('sha256').update(file.buffer).digest('hex');
 
       const command = new PutObjectCommand({
@@ -61,10 +84,16 @@ export class StorageService {
 
       await this.s3Client.send(command);
 
-      // Save to database
+      if (existingLogicalKey) {
+        await this.updateCurrentVersionFlag(logicalKey);
+      }
+
       await this.prisma.fileMetadata.create({
         data: {
           key,
+          logicalKey,
+          version,
+          isCurrent: true,
           size: file.size,
           mimeType: file.mimetype,
           hash,
@@ -73,16 +102,15 @@ export class StorageService {
         },
       });
 
-      return key;
+      return { logicalKey, version, key };
     } catch (error) {
       throw new InternalServerErrorException(`Failed to upload file: ${error.message}`);
     }
   }
 
-  async getPresignedPutUrl(fileName: string, contentType: string, size?: number, hash?: string, uploaderId?: number): Promise<{ url: string; key: string }> {
+  async getPresignedPutUrl(fileName: string, contentType: string, size?: number, hash?: string, uploaderId?: number, existingLogicalKey?: string): Promise<{ url: string; key: string, logicalKey: string, version: number }> {
     try {
-      const ext = path.extname(fileName);
-      const key = `${randomUUID()}${ext}`;
+      const { logicalKey, version, key } = await this.getNextVersionInfo(fileName, existingLogicalKey);
 
       const command = new PutObjectCommand({
         Bucket: this.bucketName,
@@ -90,13 +118,18 @@ export class StorageService {
         ContentType: contentType,
       });
 
-      // URL expires in 15 minutes for uploads
       const url = await getSignedUrl(this.s3Client, command, { expiresIn: 900 });
 
-      // Save PENDING record
+      if (existingLogicalKey) {
+        await this.updateCurrentVersionFlag(logicalKey);
+      }
+
       await this.prisma.fileMetadata.create({
         data: {
           key,
+          logicalKey,
+          version,
+          isCurrent: true,
           size,
           mimeType: contentType,
           hash,
@@ -105,15 +138,17 @@ export class StorageService {
         },
       });
 
-      return { url, key };
+      return { url, key, logicalKey, version };
     } catch (error) {
       throw new InternalServerErrorException(`Failed to generate presigned PUT URL: ${error.message}`);
     }
   }
 
-  async getPresignedUrl(key: string, user: { sub: number; role: string }): Promise<string> {
+  async getPresignedUrl(logicalKey: string, user: { sub: number; role: string }, version?: number): Promise<string> {
     try {
-      const file = await this.prisma.fileMetadata.findUnique({ where: { key } });
+      const file = await this.prisma.fileMetadata.findFirst({
+        where: { logicalKey, ...(version ? { version } : { isCurrent: true }) }
+      });
       if (!file) throw new NotFoundException('File not found');
 
       if (file.uploaderId !== user.sub && user.role !== 'admin') {
@@ -122,9 +157,8 @@ export class StorageService {
 
       const command = new GetObjectCommand({
         Bucket: this.bucketName,
-        Key: key,
+        Key: file.key,
       });
-      // URL expires in 1 hour
       return await getSignedUrl(this.s3Client, command, { expiresIn: 3600 });
     } catch (error) {
       if (error.status === 403 || error.status === 404) throw error;
@@ -132,35 +166,44 @@ export class StorageService {
     }
   }
 
-  async deleteFile(key: string, user: { sub: number; role: string }): Promise<void> {
+  async deleteFile(logicalKey: string, user: { sub: number; role: string }): Promise<void> {
     try {
-      const file = await this.prisma.fileMetadata.findUnique({ where: { key } });
-      if (file && file.uploaderId !== user.sub && user.role !== 'admin') {
+      const latestFile = await this.prisma.fileMetadata.findFirst({
+        where: { logicalKey, isCurrent: true }
+      });
+
+      if (!latestFile) {
+        throw new NotFoundException('File not found');
+      }
+
+      if (latestFile.uploaderId !== user.sub && user.role !== 'admin') {
         throw new ForbiddenException('You do not have permission to delete this file');
       }
 
-      const command = new DeleteObjectCommand({
-        Bucket: this.bucketName,
-        Key: key,
+      const allVersions = await this.prisma.fileMetadata.findMany({
+        where: { logicalKey }
       });
-      await this.s3Client.send(command);
 
-      // Also delete from database
-      await this.prisma.fileMetadata.delete({
-        where: { key },
-      }).catch(() => {
-        // Ignore if not found in db
+      for (const file of allVersions) {
+        const command = new DeleteObjectCommand({
+          Bucket: this.bucketName,
+          Key: file.key,
+        });
+        await this.s3Client.send(command).catch(() => {});
+      }
+
+      await this.prisma.fileMetadata.deleteMany({
+        where: { logicalKey },
       });
     } catch (error) {
-      if (error.status === 403) throw error;
+      if (error.status === 403 || error.status === 404) throw error;
       throw new InternalServerErrorException(`Failed to delete file: ${error.message}`);
     }
   }
 
-  async startMultipartUpload(fileName: string, contentType: string, size?: number, hash?: string, uploaderId?: number): Promise<{ uploadId: string; key: string }> {
+  async startMultipartUpload(fileName: string, contentType: string, size?: number, hash?: string, uploaderId?: number, existingLogicalKey?: string): Promise<{ uploadId: string; key: string, logicalKey: string, version: number }> {
     try {
-      const ext = path.extname(fileName);
-      const key = `${randomUUID()}${ext}`;
+      const { logicalKey, version, key } = await this.getNextVersionInfo(fileName, existingLogicalKey);
 
       const command = new CreateMultipartUploadCommand({
         Bucket: this.bucketName,
@@ -173,9 +216,16 @@ export class StorageService {
         throw new Error('UploadId is missing from AWS response');
       }
 
+      if (existingLogicalKey) {
+        await this.updateCurrentVersionFlag(logicalKey);
+      }
+
       await this.prisma.fileMetadata.create({
         data: {
           key,
+          logicalKey,
+          version,
+          isCurrent: true,
           size,
           mimeType: contentType,
           hash,
@@ -184,7 +234,7 @@ export class StorageService {
         },
       });
 
-      return { uploadId: response.UploadId, key };
+      return { uploadId: response.UploadId, key, logicalKey, version };
     } catch (error) {
       throw new InternalServerErrorException(`Failed to start multipart upload: ${error.message}`);
     }
@@ -199,7 +249,6 @@ export class StorageService {
         PartNumber: partNumber,
       });
 
-      // URL expires in 15 minutes for each part
       return await getSignedUrl(this.s3Client, command, { expiresIn: 900 });
     } catch (error) {
       throw new InternalServerErrorException(`Failed to generate presigned URL for part: ${error.message}`);
@@ -208,7 +257,6 @@ export class StorageService {
 
   async completeMultipartUpload(key: string, uploadId: string, parts: CompletedPart[], size?: number, hash?: string): Promise<void> {
     try {
-      // S3 expects parts to be sorted by PartNumber
       const sortedParts = parts.sort((a, b) => (a.PartNumber ?? 0) - (b.PartNumber ?? 0));
 
       const command = new CompleteMultipartUploadCommand({
@@ -252,8 +300,48 @@ export class StorageService {
 
   async listFiles() {
     return this.prisma.fileMetadata.findMany({
-      where: { status: 'UPLOADED' },
+      where: { status: 'UPLOADED', isCurrent: true },
       orderBy: { uploadedAt: 'desc' },
     });
+  }
+
+  async listVersions(logicalKey: string, user: { sub: number; role: string }) {
+    const versions = await this.prisma.fileMetadata.findMany({
+      where: { logicalKey },
+      orderBy: { version: 'desc' }
+    });
+
+    if (versions.length === 0) {
+      throw new NotFoundException('File not found');
+    }
+
+    if (versions[0].uploaderId !== user.sub && user.role !== 'admin') {
+      throw new ForbiddenException('You do not have permission to view this file');
+    }
+
+    return versions;
+  }
+
+  async rollbackVersion(logicalKey: string, versionToRollbackTo: number, user: { sub: number; role: string }) {
+    const file = await this.prisma.fileMetadata.findUnique({
+      where: { logicalKey_version: { logicalKey, version: versionToRollbackTo } }
+    });
+
+    if (!file) {
+      throw new NotFoundException('Version not found');
+    }
+
+    if (file.uploaderId !== user.sub && user.role !== 'admin') {
+      throw new ForbiddenException('You do not have permission to rollback this file');
+    }
+
+    await this.updateCurrentVersionFlag(logicalKey);
+
+    await this.prisma.fileMetadata.update({
+      where: { id: file.id },
+      data: { isCurrent: true }
+    });
+
+    return { message: `Rolled back to version ${versionToRollbackTo}` };
   }
 }

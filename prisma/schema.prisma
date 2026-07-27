@@ -9,10 +9,15 @@ datasource db {
 model FileMetadata {
   id         Int      @id @default(autoincrement())
   key        String   @unique
+  logicalKey String   @default(uuid())
+  version    Int      @default(1)
+  isCurrent  Boolean  @default(true)
   size       Int?
   mimeType   String
   hash       String?
   status     String   @default("UPLOADED")
   uploadedAt DateTime @default(now())
   uploaderId Int?
+
+  @@unique([logicalKey, version])
 }

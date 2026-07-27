@@ -37,42 +37,90 @@ describe('StorageController (e2e)', () => {
       .expect(200);
   });
 
-  it('/files/:key (DELETE) should fail if user does not own file and is not admin', async () => {
+  it('should upload a file, add a version, and rollback successfully', async () => {
+    const token = jwtService.sign({ sub: 1, role: 'user' }, { secret: process.env.JWT_SECRET || 'fallback_secret' });
+    
+    // 1. Upload version 1
+    const upload1Res = await request(app.getHttpServer())
+      .post('/presign-upload')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ fileName: 'test.jpg', contentType: 'image/jpeg' })
+      .expect(201);
+      
+    const logicalKey = upload1Res.body.logicalKey;
+    expect(upload1Res.body.version).toBe(1);
+
+    // 2. Upload version 2
+    const upload2Res = await request(app.getHttpServer())
+      .post('/presign-upload')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ fileName: 'test.jpg', contentType: 'image/jpeg', logicalKey })
+      .expect(201);
+      
+    expect(upload2Res.body.version).toBe(2);
+
+    // 3. List versions
+    const listRes = await request(app.getHttpServer())
+      .get(`/files/${logicalKey}/versions`)
+      .set('Authorization', `Bearer ${token}`)
+      .expect(200);
+      
+    expect(listRes.body.length).toBe(2);
+    expect(listRes.body[0].version).toBe(2);
+    expect(listRes.body[0].isCurrent).toBe(true);
+    expect(listRes.body[1].version).toBe(1);
+    expect(listRes.body[1].isCurrent).toBe(false);
+
+    // 4. Rollback to version 1
+    await request(app.getHttpServer())
+      .post(`/files/${logicalKey}/rollback/1`)
+      .set('Authorization', `Bearer ${token}`)
+      .expect(201); // Post returns 201 by default
+
+    // 5. Verify rollback
+    const listResAfter = await request(app.getHttpServer())
+      .get(`/files/${logicalKey}/versions`)
+      .set('Authorization', `Bearer ${token}`)
+      .expect(200);
+      
+    expect(listResAfter.body[1].version).toBe(1);
+    expect(listResAfter.body[1].isCurrent).toBe(true);
+    expect(listResAfter.body[0].version).toBe(2);
+    expect(listResAfter.body[0].isCurrent).toBe(false);
+  });
+
+  it('/files/:logicalKey (DELETE) should fail if user does not own file and is not admin', async () => {
     const token1 = jwtService.sign({ sub: 1, role: 'user' }, { secret: process.env.JWT_SECRET || 'fallback_secret' });
     const token2 = jwtService.sign({ sub: 2, role: 'user' }, { secret: process.env.JWT_SECRET || 'fallback_secret' });
     
-    // Upload a file as user 1
     const uploadRes = await request(app.getHttpServer())
       .post('/presign-upload')
       .set('Authorization', `Bearer ${token1}`)
       .send({ fileName: 'test.jpg', contentType: 'image/jpeg' })
       .expect(201);
       
-    const fileKey = uploadRes.body.key;
+    const logicalKey = uploadRes.body.logicalKey;
 
-    // Attempt to delete as user 2 (should fail)
     await request(app.getHttpServer())
-      .delete(`/files/${fileKey}`)
+      .delete(`/files/${logicalKey}`)
       .set('Authorization', `Bearer ${token2}`)
       .expect(403);
   });
 
-  it('/files/:key (DELETE) should succeed if user is admin', async () => {
+  it('/files/:logicalKey (DELETE) should succeed if user is admin', async () => {
     const token1 = jwtService.sign({ sub: 1, role: 'user' }, { secret: process.env.JWT_SECRET || 'fallback_secret' });
     const adminToken = jwtService.sign({ sub: 999, role: 'admin' }, { secret: process.env.JWT_SECRET || 'fallback_secret' });
     
-    // Upload a file as user 1
     const uploadRes = await request(app.getHttpServer())
       .post('/presign-upload')
       .set('Authorization', `Bearer ${token1}`)
       .send({ fileName: 'test2.jpg', contentType: 'image/jpeg' })
       .expect(201);
       
-    const fileKey = uploadRes.body.key;
+    const logicalKey = uploadRes.body.logicalKey;
 
-    // Attempt to delete as admin (should succeed)
     await request(app.getHttpServer())
-      .delete(`/files/${fileKey}`)
+      .delete(`/files/${logicalKey}`)
       .set('Authorization', `Bearer ${adminToken}`)
       .expect(200);
   });
