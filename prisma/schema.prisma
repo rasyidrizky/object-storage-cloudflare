@@ -14,4 +14,5 @@ model FileMetadata {
   hash       String?
   status     String   @default("UPLOADED")
   uploadedAt DateTime @default(now())
+  uploaderId Int?
 }

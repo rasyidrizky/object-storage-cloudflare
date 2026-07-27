@@ -10,14 +10,19 @@ import {
   ParseFilePipe,
   MaxFileSizeValidator,
   FileTypeValidator,
-  BadRequestException
+  BadRequestException,
+  UseGuards
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
-import { ApiTags, ApiOperation, ApiConsumes, ApiBody, ApiParam, ApiResponse } from '@nestjs/swagger';
+import { ApiTags, ApiOperation, ApiConsumes, ApiBody, ApiParam, ApiResponse, ApiBearerAuth } from '@nestjs/swagger';
 import { StorageService } from './storage.service';
+import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { CurrentUser } from '../auth/current-user.decorator';
 
 @ApiTags('Storage')
+@ApiBearerAuth()
 @Controller('')
+@UseGuards(JwtAuthGuard)
 export class StorageController {
   constructor(private readonly storageService: StorageService) {}
 
@@ -48,8 +53,9 @@ export class StorageController {
       }),
     )
     file: Express.Multer.File,
+    @CurrentUser() user: any,
   ) {
-    const key = await this.storageService.uploadFile(file);
+    const key = await this.storageService.uploadFile(file, user.sub);
     return { key };
   }
 
@@ -68,11 +74,11 @@ export class StorageController {
     },
   })
   @ApiResponse({ status: 201, description: 'Returns the presigned URL and file key' })
-  async getPresignedPutUrl(@Body() body: { fileName: string; contentType: string; size?: number; hash?: string }) {
+  async getPresignedPutUrl(@Body() body: { fileName: string; contentType: string; size?: number; hash?: string }, @CurrentUser() user: any) {
     if (!body.fileName || !body.contentType) {
       throw new BadRequestException('fileName and contentType are required');
     }
-    return await this.storageService.getPresignedPutUrl(body.fileName, body.contentType, body.size, body.hash);
+    return await this.storageService.getPresignedPutUrl(body.fileName, body.contentType, body.size, body.hash, user.sub);
   }
 
   @Post('multipart/start')
@@ -90,11 +96,11 @@ export class StorageController {
     },
   })
   @ApiResponse({ status: 201, description: 'Returns the uploadId and file key' })
-  async startMultipartUpload(@Body() body: { fileName: string; contentType: string; size?: number; hash?: string }) {
+  async startMultipartUpload(@Body() body: { fileName: string; contentType: string; size?: number; hash?: string }, @CurrentUser() user: any) {
     if (!body.fileName || !body.contentType) {
       throw new BadRequestException('fileName and contentType are required');
     }
-    return await this.storageService.startMultipartUpload(body.fileName, body.contentType, body.size, body.hash);
+    return await this.storageService.startMultipartUpload(body.fileName, body.contentType, body.size, body.hash, user.sub);
   }
 
   @Post('multipart/presign-part')
@@ -185,8 +191,8 @@ export class StorageController {
   @ApiOperation({ summary: 'Get a presigned URL to access the file' })
   @ApiParam({ name: 'key', description: 'The file key returned from upload' })
   @ApiResponse({ status: 200, description: 'Returns the presigned URL' })
-  async getFileUrl(@Param('key') key: string) {
-    const url = await this.storageService.getPresignedUrl(key);
+  async getFileUrl(@Param('key') key: string, @CurrentUser() user: any) {
+    const url = await this.storageService.getPresignedUrl(key, user);
     return { url };
   }
 
@@ -194,8 +200,8 @@ export class StorageController {
   @ApiOperation({ summary: 'Delete a file from storage' })
   @ApiParam({ name: 'key', description: 'The file key to delete' })
   @ApiResponse({ status: 200, description: 'File successfully deleted' })
-  async deleteFile(@Param('key') key: string) {
-    await this.storageService.deleteFile(key);
+  async deleteFile(@Param('key') key: string, @CurrentUser() user: any) {
+    await this.storageService.deleteFile(key, user);
     return { message: 'File deleted successfully' };
   }
 }

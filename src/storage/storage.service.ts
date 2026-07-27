@@ -1,4 +1,4 @@
-import { Injectable, InternalServerErrorException, NotFoundException, BadRequestException } from '@nestjs/common';
+import { Injectable, InternalServerErrorException, NotFoundException, BadRequestException, ForbiddenException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../prisma/prisma.service';
 import { createHash } from 'crypto';
@@ -44,7 +44,7 @@ export class StorageService {
     });
   }
 
-  async uploadFile(file: Express.Multer.File): Promise<string> {
+  async uploadFile(file: Express.Multer.File, uploaderId?: number): Promise<string> {
     try {
       const ext = path.extname(file.originalname);
       const key = `${randomUUID()}${ext}`;
@@ -69,6 +69,7 @@ export class StorageService {
           mimeType: file.mimetype,
           hash,
           status: 'UPLOADED',
+          uploaderId,
         },
       });
 
@@ -78,7 +79,7 @@ export class StorageService {
     }
   }
 
-  async getPresignedPutUrl(fileName: string, contentType: string, size?: number, hash?: string): Promise<{ url: string; key: string }> {
+  async getPresignedPutUrl(fileName: string, contentType: string, size?: number, hash?: string, uploaderId?: number): Promise<{ url: string; key: string }> {
     try {
       const ext = path.extname(fileName);
       const key = `${randomUUID()}${ext}`;
@@ -100,6 +101,7 @@ export class StorageService {
           mimeType: contentType,
           hash,
           status: 'PENDING',
+          uploaderId,
         },
       });
 
@@ -109,8 +111,15 @@ export class StorageService {
     }
   }
 
-  async getPresignedUrl(key: string): Promise<string> {
+  async getPresignedUrl(key: string, user: { sub: number; role: string }): Promise<string> {
     try {
+      const file = await this.prisma.fileMetadata.findUnique({ where: { key } });
+      if (!file) throw new NotFoundException('File not found');
+
+      if (file.uploaderId !== user.sub && user.role !== 'admin') {
+        throw new ForbiddenException('You do not have access to this file');
+      }
+
       const command = new GetObjectCommand({
         Bucket: this.bucketName,
         Key: key,
@@ -118,12 +127,18 @@ export class StorageService {
       // URL expires in 1 hour
       return await getSignedUrl(this.s3Client, command, { expiresIn: 3600 });
     } catch (error) {
+      if (error.status === 403 || error.status === 404) throw error;
       throw new InternalServerErrorException(`Failed to generate presigned URL: ${error.message}`);
     }
   }
 
-  async deleteFile(key: string): Promise<void> {
+  async deleteFile(key: string, user: { sub: number; role: string }): Promise<void> {
     try {
+      const file = await this.prisma.fileMetadata.findUnique({ where: { key } });
+      if (file && file.uploaderId !== user.sub && user.role !== 'admin') {
+        throw new ForbiddenException('You do not have permission to delete this file');
+      }
+
       const command = new DeleteObjectCommand({
         Bucket: this.bucketName,
         Key: key,
@@ -137,11 +152,12 @@ export class StorageService {
         // Ignore if not found in db
       });
     } catch (error) {
+      if (error.status === 403) throw error;
       throw new InternalServerErrorException(`Failed to delete file: ${error.message}`);
     }
   }
 
-  async startMultipartUpload(fileName: string, contentType: string, size?: number, hash?: string): Promise<{ uploadId: string; key: string }> {
+  async startMultipartUpload(fileName: string, contentType: string, size?: number, hash?: string, uploaderId?: number): Promise<{ uploadId: string; key: string }> {
     try {
       const ext = path.extname(fileName);
       const key = `${randomUUID()}${ext}`;
@@ -164,6 +180,7 @@ export class StorageService {
           mimeType: contentType,
           hash,
           status: 'PENDING',
+          uploaderId,
         },
       });
 

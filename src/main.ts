@@ -10,6 +10,7 @@ async function bootstrap() {
     .setTitle('File Host API')
     .setDescription('Minimal image/file host API using Cloudflare R2')
     .setVersion('1.0')
+    .addBearerAuth()
     .build();
   
   const document = SwaggerModule.createDocument(app, config);
